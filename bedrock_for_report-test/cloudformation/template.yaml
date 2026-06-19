@@ -1,0 +1,400 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: CodeBuddy GitHub PR review agent infrastructure.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Deployment package
+        Parameters:
+          - LambdaS3Bucket
+          - LambdaS3Key
+      - Label:
+          default: Bedrock Agent
+        Parameters:
+          - EnableBedrock
+          - AgentId
+          - AgentAliasId
+      - Label:
+          default: External integrations
+        Parameters:
+          - GitHubToken
+          - GitHubWebhookSecret
+          - DiscordWebhookUrl
+          - GitHubApiBase
+      - Label:
+          default: Runtime settings
+        Parameters:
+          - ProjectName
+          - StageName
+          - LogRetentionDays
+    ParameterLabels:
+      LambdaS3Bucket:
+        default: Lambda artifact S3 bucket
+      LambdaS3Key:
+        default: Lambda artifact S3 key
+      AgentId:
+        default: Bedrock Agent ID
+      AgentAliasId:
+        default: Bedrock Agent Alias ID
+      EnableBedrock:
+        default: Enable Bedrock Agent calls
+      GitHubToken:
+        default: GitHub token
+      GitHubWebhookSecret:
+        default: GitHub webhook secret
+      DiscordWebhookUrl:
+        default: Discord incoming webhook URL
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: codebuddy
+    AllowedPattern: "^[a-z][a-z0-9-]{2,30}$"
+    Description: Lowercase project prefix used for AWS resource names.
+  LambdaS3Bucket:
+    Type: String
+    Default: codebuddy-artifacts-582071018894-ap-northeast-2
+    AllowedPattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+    Description: S3 bucket containing the Lambda deployment zip.
+  LambdaS3Key:
+    Type: String
+    Default: codebuddy/codebuddy-lambda.zip
+    Description: S3 key for the Lambda deployment zip.
+  AgentId:
+    Type: String
+    Default: disabled
+    Description: Existing Amazon Bedrock Agent ID. Keep disabled while EnableBedrock is false.
+  AgentAliasId:
+    Type: String
+    Default: disabled
+    Description: Existing Amazon Bedrock Agent Alias ID. Keep disabled while EnableBedrock is false.
+  EnableBedrock:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+  GitHubToken:
+    Type: String
+    NoEcho: true
+    MinLength: 1
+    Description: "GitHub fine-grained token. Required permissions: Contents read, Pull requests read, Issues read/write, Metadata read."
+  GitHubWebhookSecret:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    Description: Shared secret configured in the GitHub webhook.
+  DiscordWebhookUrl:
+    Type: String
+    NoEcho: true
+    AllowedPattern: "^https://discord\\.com/api/webhooks/.+|^https://discordapp\\.com/api/webhooks/.+"
+    Description: Discord incoming webhook URL.
+  GitHubApiBase:
+    Type: String
+    Default: https://api.github.com
+    Description: "GitHub API base URL. Keep the default unless using GitHub Enterprise."
+  StageName:
+    Type: String
+    Default: prod
+    AllowedPattern: "^[a-zA-Z0-9_-]+$"
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [7, 14, 30, 60, 90]
+
+Conditions:
+  UseBedrock: !Equals [!Ref EnableBedrock, "true"]
+
+Resources:
+  ReviewCacheTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: ReviewKey
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ReviewKey
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ExpiresAt
+        Enabled: false
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuddyLambdaPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*
+              - !If
+                - UseBedrock
+                - Effect: Allow
+                  Action:
+                    - bedrock:InvokeAgent
+                  Resource: !Sub arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:agent-alias/${AgentId}/${AgentAliasId}
+                - !Ref AWS::NoValue
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: CodeBuddy
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                Resource: !GetAtt ReviewCacheTable.Arn
+
+  OrchestratorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-orchestrator
+      Runtime: python3.12
+      Handler: orchestrator.handler
+      Timeout: 300
+      MemorySize: 1024
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaS3Bucket
+        S3Key: !Ref LambdaS3Key
+      Environment:
+        Variables:
+          BEDROCK_AGENT_ID: !Ref AgentId
+          BEDROCK_AGENT_ALIAS_ID: !Ref AgentAliasId
+          ENABLE_BEDROCK: !Ref EnableBedrock
+          GITHUB_TOKEN: !Ref GitHubToken
+          GITHUB_WEBHOOK_SECRET: !Ref GitHubWebhookSecret
+          GITHUB_API_BASE: !Ref GitHubApiBase
+          DISCORD_WEBHOOK_URL: !Ref DiscordWebhookUrl
+          REVIEW_CACHE_TABLE: !Ref ReviewCacheTable
+
+  ActionGroupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-action-group
+      Runtime: python3.12
+      Handler: action_group.handler
+      Timeout: 120
+      MemorySize: 512
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaS3Bucket
+        S3Key: !Ref LambdaS3Key
+      Environment:
+        Variables:
+          GITHUB_TOKEN: !Ref GitHubToken
+          GITHUB_API_BASE: !Ref GitHubApiBase
+          DISCORD_WEBHOOK_URL: !Ref DiscordWebhookUrl
+
+  OrchestratorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${OrchestratorFunction}
+      RetentionInDays: !Ref LogRetentionDays
+
+  ActionGroupLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ActionGroupFunction}
+      RetentionInDays: !Ref LogRetentionDays
+
+  ActionGroupInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ActionGroupFunction
+      Action: lambda:InvokeFunction
+      Principal: bedrock.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+
+  ApiGatewayCloudWatchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ApiGatewayCloudWatchLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                  - logs:PutLogEvents
+                  - logs:GetLogEvents
+                  - logs:FilterLogEvents
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*
+
+  ApiGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayCloudWatchRole.Arn
+
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub ${ProjectName}-api
+      EndpointConfiguration:
+        Types: [REGIONAL]
+
+  ReviewResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: review
+
+  ReviewMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref ReviewResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      ApiKeyRequired: false
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OrchestratorFunction.Arn}/invocations
+
+  ApiGatewayInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OrchestratorFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/POST/review
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ReviewMethod
+    Properties:
+      RestApiId: !Ref ApiGateway
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    DependsOn:
+      - ApiGatewayAccount
+    Properties:
+      RestApiId: !Ref ApiGateway
+      DeploymentId: !Ref ApiDeployment
+      StageName: !Ref StageName
+      MethodSettings:
+        - ResourcePath: /review
+          HttpMethod: POST
+          MetricsEnabled: true
+          LoggingLevel: INFO
+          ThrottlingBurstLimit: 10
+          ThrottlingRateLimit: 5
+
+  ManualTestApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    Properties:
+      Name: !Sub ${ProjectName}-manual-test-key
+      Enabled: true
+
+  UsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    Properties:
+      UsagePlanName: !Sub ${ProjectName}-usage-plan
+      ApiStages:
+        - ApiId: !Ref ApiGateway
+          Stage: !Ref ApiStage
+      Throttle:
+        BurstLimit: 10
+        RateLimit: 5
+      Quota:
+        Limit: 1000
+        Period: MONTH
+
+  UsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref ManualTestApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref UsagePlan
+
+  CodeBuddyDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub ${ProjectName}-dashboard
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "region": "${AWS::Region}",
+                "title": "CodeBuddy Review Metrics",
+                "metrics": [
+                  ["CodeBuddy", "ReviewDuration"],
+                  [".", "Success"],
+                  [".", "Failure"],
+                  [".", "ToolCallCount"]
+                ],
+                "period": 300,
+                "stat": "Average"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "region": "${AWS::Region}",
+                "title": "Lambda Duration and Errors",
+                "metrics": [
+                  ["AWS/Lambda", "Duration", "FunctionName", "${OrchestratorFunction}"],
+                  [".", "Errors", ".", "."],
+                  [".", "Invocations", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Average"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  ReviewEndpoint:
+    Description: GitHub webhook payload URL.
+    Value: !Sub https://${ApiGateway}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${StageName}/review
+  ManualTestApiKeyId:
+    Description: API key ID for manual API tests.
+    Value: !Ref ManualTestApiKey
+  OrchestratorFunctionName:
+    Value: !Ref OrchestratorFunction
+  ActionGroupFunctionArn:
+    Description: Use this ARN as the Bedrock Agent action group Lambda target.
+    Value: !GetAtt ActionGroupFunction.Arn
+  ReviewCacheTableName:
+    Value: !Ref ReviewCacheTable

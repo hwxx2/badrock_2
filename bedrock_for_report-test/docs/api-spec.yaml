@@ -1,0 +1,44 @@
+openapi: 3.0.3
+info:
+  title: CodeBuddy Review API
+  version: 1.0.0
+paths:
+  /review:
+    post:
+      summary: Trigger a CodeBuddy review for a GitHub pull request
+      description: Accepts either a GitHub pull_request webhook payload or a manual payload with pr_url.
+      operationId: reviewPullRequest
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - type: object
+                  required: [pr_url]
+                  properties:
+                    pr_url:
+                      type: string
+                      example: https://github.com/my-org/my-repo/pull/1
+                - type: object
+                  required: [action, pull_request]
+                  properties:
+                    action:
+                      type: string
+                      enum: [opened, reopened, synchronize, ready_for_review]
+                    pull_request:
+                      type: object
+                      required: [html_url]
+                      properties:
+                        html_url:
+                          type: string
+      responses:
+        "200":
+          description: Review completed
+        "202":
+          description: Webhook ignored because the pull request action is not reviewable
+        "400":
+          description: Invalid payload or signature
+        "502":
+          description: GitHub API error
+

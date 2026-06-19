@@ -1,0 +1,10 @@
+Adobe-Korea1-UCS2
+page-*.png
+artifacts/
+packaged-template.yaml
+*.zip
+__pycache__/
+.pytest_cache/
+.env
+.venv/
+

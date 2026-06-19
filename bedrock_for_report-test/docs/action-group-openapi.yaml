@@ -1,0 +1,119 @@
+openapi: 3.0.3
+info:
+  title: CodeBuddy Bedrock Action Group
+  version: 1.0.0
+paths:
+  /github/pr:
+    post:
+      operationId: get_github_pr
+      description: Fetch pull request metadata and changed file patches from GitHub.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pr_url]
+              properties:
+                pr_url:
+                  type: string
+      responses:
+        "200":
+          description: PR metadata and diff bundle
+  /security/analyze:
+    post:
+      operationId: analyze_security
+      description: Find security issues in changed code.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [diff_bundle]
+              properties:
+                diff_bundle:
+                  type: object
+      responses:
+        "200":
+          description: Security findings
+  /complexity/analyze:
+    post:
+      operationId: analyze_complexity
+      description: Estimate complexity and large-change risk.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [diff_bundle]
+              properties:
+                diff_bundle:
+                  type: object
+      responses:
+        "200":
+          description: Complexity findings
+  /tests/generate:
+    post:
+      operationId: generate_unit_test
+      description: Generate unit test suggestions for the pull request.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [diff_bundle]
+              properties:
+                diff_bundle:
+                  type: object
+                findings:
+                  type: array
+                  items:
+                    type: object
+      responses:
+        "200":
+          description: Test suggestions
+  /refactor/suggest:
+    post:
+      operationId: suggest_refactor
+      description: Suggest refactoring steps based on review findings.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [diff_bundle]
+              properties:
+                diff_bundle:
+                  type: object
+                findings:
+                  type: array
+                  items:
+                    type: object
+      responses:
+        "200":
+          description: Refactoring suggestions
+  /discord/notify:
+    post:
+      operationId: send_discord
+      description: Send a review-complete notification to Discord.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pr_url, status, summary]
+              properties:
+                pr_url:
+                  type: string
+                status:
+                  type: string
+                summary:
+                  type: string
+      responses:
+        "200":
+          description: Discord delivery result
